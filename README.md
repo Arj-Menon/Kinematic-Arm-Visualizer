@@ -40,6 +40,7 @@ pip install PyQt6 pandas openpyxl
 Launch the app from your terminal:
 
 ```bash
+cd "File directory"
 python main.py
 ```
 
