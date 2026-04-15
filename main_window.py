@@ -43,15 +43,15 @@ HEADER_RENAME_MAP = {
 
 
 def _normalize_headers(df):
-    """Rename known legacy columns, drop duplicates, enforce canonical order."""
+    """Rename legacy columns, drop exact duplicates, enforce canonical order."""
     df = df.rename(columns=HEADER_RENAME_MAP)
-    # Remove duplicate-named columns (keep first occurrence).
-    df = df.loc[:, ~df.columns.duplicated()]
-    # Add any missing canonical columns as blanks.
+    # Remove duplicate column names (keep first occurrence).
+    df = df.loc[:, ~df.columns.duplicated(keep='first')]
+    # Add any missing canonical columns as empty strings.
     for col in EXPECTED_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    # Enforce canonical order; keep unknown extras at the end.
+    # Enforce canonical order; preserve unknown extras at the end.
     extras = [c for c in df.columns if c not in EXPECTED_COLUMNS]
     return df[EXPECTED_COLUMNS + extras].copy()
 
@@ -136,12 +136,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Load error", f"Failed to read Excel:\n{exc}")
             return
 
-        # Keep/align expected columns (add missing as blank, preserve extras after)
-        for col in EXPECTED_COLUMNS:
-            if col not in df.columns:
-                df[col] = ""
-        ordered = EXPECTED_COLUMNS + [c for c in df.columns if c not in EXPECTED_COLUMNS]
-        self.df = df[ordered].copy()
+        # Normalize headers to canonical names, handle legacy variants.
+        self.df = _normalize_headers(df)
         self.current_xlsx = path
 
         self.table.setModel(PandasModel(self.df))
@@ -157,12 +153,25 @@ class MainWindow(QMainWindow):
             return
         new_row = dlg.data()
 
-        # Append to in-memory df (preserve column order & any extras).
-        self.df = pd.concat(
-            [self.df, pd.DataFrame([new_row])], ignore_index=True
-        )
+        # Ensure new row uses canonical column names.
+        new_row = {
+            "Company": new_row.get("Company", ""),
+            "Model": new_row.get("Model", ""),
+            "Kinematic Chain": new_row.get("Kinematic Chain", ""),
+            "Payload [Kg]": float(new_row.get("Payload [Kg]", 0.0)),
+            "Weight [Kg]": float(new_row.get("Weight [Kg]", 0.0)),
+            "Cost": float(new_row.get("Cost", 0.0)),
+            "Max Length [mm]": float(new_row.get("Max Length [mm]", 0.0)),
+        }
 
-        # Persist to Excel.
+        # Append to in-memory df and normalize.
+        new_df = pd.DataFrame([new_row])
+        self.df = pd.concat([self.df, new_df], ignore_index=True)
+        # Drop any duplicate-named columns and re-normalize.
+        self.df = self.df.loc[:, ~self.df.columns.duplicated(keep='first')]
+        self.df = _normalize_headers(self.df)
+
+        # Persist to Excel with proper, canonical headers.
         try:
             self.df.to_excel(self.current_xlsx, index=False)
         except Exception as exc:
@@ -190,7 +199,7 @@ class MainWindow(QMainWindow):
             if chain:
                 default_cfg = chain
             try:
-                ml = float(row.get("Max Length", 0) or 0)
+                ml = float(row.get("Max Length [mm]", 0) or 0)
                 if ml > 0:
                     default_len = ml
             except (TypeError, ValueError):

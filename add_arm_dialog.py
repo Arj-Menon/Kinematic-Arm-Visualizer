@@ -19,18 +19,26 @@ class AddArmDialog(QDialog):
         self.chain = QLineEdit()
         self.chain.setPlaceholderText("e.g. Y-P-P-R-P-R")
 
-        self.payload = QDoubleSpinBox(); self.payload.setSuffix(" kg")
-        self.payload.setRange(0.0, 100000.0); self.payload.setDecimals(2)
+        self.payload = QDoubleSpinBox()
+        self.payload.setSuffix(" kg")
+        self.payload.setRange(0.0, 100000.0)
+        self.payload.setDecimals(2)
 
-        self.weight = QDoubleSpinBox(); self.weight.setSuffix(" kg")
-        self.weight.setRange(0.0, 100000.0); self.weight.setDecimals(2)
+        self.weight = QDoubleSpinBox()
+        self.weight.setSuffix(" kg")
+        self.weight.setRange(0.0, 100000.0)
+        self.weight.setDecimals(2)
 
-        self.cost = QDoubleSpinBox(); self.cost.setPrefix("$ ")
-        self.cost.setRange(0.0, 1e9); self.cost.setDecimals(2)
+        self.cost = QDoubleSpinBox()
+        self.cost.setPrefix("$ ")
+        self.cost.setRange(0.0, 1e9)
+        self.cost.setDecimals(2)
         self.cost.setGroupSeparatorShown(True)
 
-        self.max_length = QDoubleSpinBox(); self.max_length.setSuffix(" mm")
-        self.max_length.setRange(0.0, 1e6); self.max_length.setDecimals(1)
+        self.max_length = QDoubleSpinBox()
+        self.max_length.setSuffix(" mm")
+        self.max_length.setRange(0.0, 1e6)
+        self.max_length.setDecimals(1)
 
         form = QFormLayout(self)
         form.addRow("Company:", self.company)
@@ -66,8 +74,8 @@ class AddArmDialog(QDialog):
             "Company": self.company.text().strip(),
             "Model": self.model.text().strip(),
             "Kinematic Chain": self.chain.text().strip(),
-            "Payload": self.payload.value(),
-            "Weight": self.weight.value(),
+            "Payload [Kg]": self.payload.value(),
+            "Weight [Kg]": self.weight.value(),
             "Cost": self.cost.value(),
-            "Max Length": self.max_length.value(),
+            "Max Length [mm]": self.max_length.value(),
         }
