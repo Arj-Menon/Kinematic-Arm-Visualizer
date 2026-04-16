@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 from pandas_model import PandasModel
 from visualizer_window import VisualizerWindow
 from add_arm_dialog import AddArmDialog
+from mtc_window import MTCWindow
 
 
 DEFAULT_XLSX = Path(__file__).parent / "robotic_arms.xlsx"
@@ -66,7 +67,9 @@ class MainWindow(QMainWindow):
 
         self.df = pd.DataFrame(columns=EXPECTED_COLUMNS)
         self._visualizers = []  # keep references so windows aren't GC'd
+        self._mtc_windows = []
         self.current_xlsx = DEFAULT_XLSX
+        self.model: PandasModel | None = None
 
         self._build_ui()
         self._load_excel(DEFAULT_XLSX)
@@ -89,11 +92,15 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         self.btn_reload = QPushButton("Reload Excel…")
         self.btn_add = QPushButton("Add New Arm…")
+        self.btn_save = QPushButton("Save Changes")
+        self.btn_launch_mtc = QPushButton("Launch MTC")
         self.btn_launch = QPushButton("Launch Visualizer")
         self.btn_launch.setDefault(True)
         btn_row.addWidget(self.btn_reload)
         btn_row.addWidget(self.btn_add)
+        btn_row.addWidget(self.btn_save)
         btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_launch_mtc)
         btn_row.addWidget(self.btn_launch)
         layout.addLayout(btn_row)
 
@@ -112,6 +119,8 @@ class MainWindow(QMainWindow):
         # Signals
         self.btn_reload.clicked.connect(lambda: self._load_excel(self.current_xlsx))
         self.btn_add.clicked.connect(self._add_arm)
+        self.btn_save.clicked.connect(self._save_changes)
+        self.btn_launch_mtc.clicked.connect(self._launch_mtc)
         self.btn_launch.clicked.connect(self._launch_visualizer)
         self.table.doubleClicked.connect(lambda _ix: self._launch_visualizer())
 
@@ -140,12 +149,54 @@ class MainWindow(QMainWindow):
         self.df = _normalize_headers(df)
         self.current_xlsx = path
 
-        self.table.setModel(PandasModel(self.df))
+        self.model = PandasModel(self.df)
+        self.table.setModel(self.model)
         self.table.resizeColumnsToContents()
 
     def _refresh_table(self):
-        self.table.setModel(PandasModel(self.df))
+        self.model = PandasModel(self.df)
+        self.table.setModel(self.model)
         self.table.resizeColumnsToContents()
+
+    def _save_changes(self):
+        """Flush inline edits + current DataFrame back to Excel."""
+        # Pull the freshest frame straight from the model (edits live there).
+        if self.model is not None:
+            self.df = _normalize_headers(self.model.dataframe())
+        try:
+            self.df.to_excel(self.current_xlsx, index=False)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Save error",
+                f"Failed to write {self.current_xlsx}:\n{exc}",
+            )
+            return
+        QMessageBox.information(
+            self, "Saved",
+            f"Saved {len(self.df)} rows to {self.current_xlsx.name}.",
+        )
+
+    def _launch_mtc(self):
+        """Open the standalone Motor Torque Calculator, pre-filled if possible."""
+        row = self._selected_row()
+        chain = "Y-P-P-R-P-R"
+        length = 600.0
+        arm_label = ""
+        if row is not None:
+            c = str(row.get("Kinematic Chain", "") or "").strip()
+            if c:
+                chain = c
+            try:
+                ml = float(row.get("Max Length [mm]", 0) or 0)
+                if ml > 0:
+                    length = ml
+            except (TypeError, ValueError):
+                pass
+            arm_label = f"{row.get('Company', '')} {row.get('Model', '')}".strip()
+        dlg = MTCWindow(chain=chain, total_length_mm=length,
+                        arm_label=arm_label, parent=self)
+        dlg.show()
+        self._mtc_windows.append(dlg)
 
     def _add_arm(self):
         dlg = AddArmDialog(self)
@@ -163,6 +214,10 @@ class MainWindow(QMainWindow):
             "Cost": float(new_row.get("Cost", 0.0)),
             "Max Length [mm]": float(new_row.get("Max Length [mm]", 0.0)),
         }
+
+        # Preserve any pending inline edits before appending.
+        if self.model is not None:
+            self.df = self.model.dataframe()
 
         # Append to in-memory df and normalize.
         new_df = pd.DataFrame([new_row])

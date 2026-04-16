@@ -18,10 +18,17 @@ from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen, QFont, QPolygonF
 from PyQt6.QtWidgets import (
     QMainWindow, QGraphicsView, QInputDialog, QMessageBox, QToolBar,
-    QLabel, QWidget, QVBoxLayout, QFrame,
+    QLabel, QWidget, QVBoxLayout, QFrame, QDockWidget, QGridLayout,
+    QDoubleSpinBox, QScrollArea, QHBoxLayout, QPushButton,
 )
 
 from graphics_items import JointBlock, LinkLine, GridScene
+from mtc_window import (
+    compute_torques_full, compute_torques_with_breakdown,
+    MathBreakdownDialog,
+)
+from actuator_selector import ActuatorSelector
+import actuators_db
 
 
 SCENE_W = 4000
@@ -151,6 +158,205 @@ class ShapeLegend(QFrame):
 
 
 # =========================================================================
+class LiveMTCPanel(QWidget):
+    """
+    Live Motor Torque tracker for the visualizer.
+
+    Inputs per joint/link row:
+      * Link Weight (QDoubleSpinBox).
+      * Actuator (QComboBox of presets + Custom… + "+" to save).
+    Plus a dedicated Payload (kg) row acting at the end-effector.
+
+    Math (horizontal arm, worst-case):
+      τ_j = Σ_{i≥j} m_link_i · g · (X_mid_i − X_j)
+          + Σ_{k>j} m_act_k  · g · (X_joint_k − X_j)
+          + m_payload · g · (X_end − X_j)
+
+    Refreshes reactively on: link resize (via on_length_changed →
+    _refresh_status), link weight change, actuator selection, and payload
+    change.
+    """
+
+    def __init__(self, blocks: list, links: list, parent=None):
+        super().__init__(parent)
+        self.blocks = blocks
+        self.links = links
+        self._presets = actuators_db.load()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        title = QLabel("<h3>Live MTC Tracker</h3>")
+        title.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(title)
+
+        subtitle = QLabel(
+            "Worst-case static holding torque with the arm fully horizontal. "
+            "Accounts for link masses, outboard actuator masses, and an "
+            "end-effector payload."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #555;")
+        root.addWidget(subtitle)
+
+        # --- Links: length (read-only) + link-weight spin -----------------
+        link_frame = QFrame(); link_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        link_v = QVBoxLayout(link_frame)
+        link_v.addWidget(QLabel("<b>Links</b>"))
+
+        link_grid = QGridLayout()
+        link_grid.addWidget(QLabel("<b>#</b>"), 0, 0)
+        link_grid.addWidget(QLabel("<b>Length</b>"), 0, 1)
+        link_grid.addWidget(QLabel("<b>Link Weight</b>"), 0, 2)
+
+        self.length_labels: list[QLabel] = []
+        self.link_weight_spins: list[QDoubleSpinBox] = []
+        for i, link in enumerate(links):
+            link_grid.addWidget(QLabel(f"L{i + 1}"), i + 1, 0)
+
+            lbl = QLabel(f"{link.mm_length:.1f} mm")
+            lbl.setStyleSheet("font-family: Consolas, monospace;")
+            link_grid.addWidget(lbl, i + 1, 1)
+            self.length_labels.append(lbl)
+
+            ws = QDoubleSpinBox()
+            ws.setRange(0.0, 1000.0)
+            ws.setDecimals(3)
+            ws.setSuffix(" kg")
+            ws.setValue(1.0)
+            ws.valueChanged.connect(self.refresh)
+            link_grid.addWidget(ws, i + 1, 2)
+            self.link_weight_spins.append(ws)
+        link_v.addLayout(link_grid)
+        root.addWidget(link_frame)
+
+        # --- Actuators: one preset selector per joint --------------------
+        act_frame = QFrame(); act_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        act_v = QVBoxLayout(act_frame)
+        act_v.addWidget(QLabel("<b>Actuators (per joint)</b>"))
+
+        act_grid = QGridLayout()
+        act_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
+        act_grid.addWidget(QLabel("<b>Actuator Preset</b>"), 0, 1)
+
+        self.actuator_selectors: list[ActuatorSelector] = []
+        for i, blk in enumerate(blocks):
+            act_grid.addWidget(QLabel(blk.label), i + 1, 0)
+            sel = ActuatorSelector(self._presets, self)
+            sel.sig_changed = self.refresh
+            act_grid.addWidget(sel, i + 1, 1)
+            self.actuator_selectors.append(sel)
+        act_v.addLayout(act_grid)
+        root.addWidget(act_frame)
+
+        # --- Payload ----------------------------------------------------
+        pay_frame = QFrame(); pay_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        pay_layout = QHBoxLayout(pay_frame)
+        pay_layout.addWidget(QLabel("<b>Payload</b> (at end-effector):"))
+        self.payload_spin = QDoubleSpinBox()
+        self.payload_spin.setRange(0.0, 1000.0)
+        self.payload_spin.setDecimals(3)
+        self.payload_spin.setSuffix(" kg")
+        self.payload_spin.setValue(0.0)
+        self.payload_spin.valueChanged.connect(self.refresh)
+        pay_layout.addWidget(self.payload_spin)
+        pay_layout.addStretch(1)
+        root.addWidget(pay_frame)
+
+        # --- Outputs ----------------------------------------------------
+        out_frame = QFrame(); out_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        out_v = QVBoxLayout(out_frame)
+        out_v.addWidget(QLabel("<b>Required Holding Torque</b>"))
+
+        out_grid = QGridLayout()
+        out_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
+        out_grid.addWidget(QLabel("<b>Torque (N·m)</b>"), 0, 1)
+
+        self.torque_labels: list[QLabel] = []
+        for i, blk in enumerate(blocks):
+            out_grid.addWidget(QLabel(blk.label), i + 1, 0)
+            tl = QLabel("0.00")
+            tl.setStyleSheet(
+                "font-family: Consolas, monospace; font-weight: bold;"
+                " padding: 2px 8px;"
+            )
+            out_grid.addWidget(tl, i + 1, 1)
+            self.torque_labels.append(tl)
+        out_v.addLayout(out_grid)
+        root.addWidget(out_frame)
+
+        # --- Math verification ------------------------------------------
+        self.btn_breakdown = QPushButton("Show Math Breakdown")
+        self.btn_breakdown.setToolTip(
+            "Open an audit view listing every force × lever-arm term "
+            "contributing to each joint's torque."
+        )
+        self.btn_breakdown.clicked.connect(self._show_breakdown)
+        root.addWidget(self.btn_breakdown)
+        root.addStretch(1)
+
+        self.refresh()
+
+    # ----------------------------------------------------------------
+    def on_preset_added(self, presets: dict[str, float],
+                        select_name: str, origin: "ActuatorSelector"):
+        """A selector just saved a new preset -- rebroadcast to peers."""
+        self._presets = presets
+        for sel in self.actuator_selectors:
+            if sel is origin:
+                sel.refresh_presets(presets, keep_selection=False)
+                idx = sel.combo.findText(select_name)
+                if idx >= 0:
+                    sel.combo.setCurrentIndex(idx)
+            else:
+                sel.refresh_presets(presets, keep_selection=True)
+        self.refresh()
+
+    def refresh(self):
+        """Recompute torques from live scene + all input widgets."""
+        lengths_m = [lk.mm_length / 1000.0 for lk in self.links]
+        link_masses = [s.value() for s in self.link_weight_spins]
+        actuator_masses = [sel.value() for sel in self.actuator_selectors]
+        payload = float(self.payload_spin.value())
+
+        for i, lk in enumerate(self.links):
+            self.length_labels[i].setText(f"{lk.mm_length:.1f} mm")
+
+        torques = compute_torques_full(
+            lengths_m=lengths_m,
+            link_masses=link_masses,
+            actuator_masses=actuator_masses,
+            payload_mass=payload,
+        )
+        for i, tl in enumerate(self.torque_labels):
+            if i < len(torques):
+                tl.setText(f"{torques[i]:.2f}")
+            else:
+                tl.setText("—")
+
+    # ----------------------------------------------------------------
+    def _show_breakdown(self):
+        """Pop up a read-only dialog with the full math breakdown."""
+        lengths_m = [lk.mm_length / 1000.0 for lk in self.links]
+        link_masses = [s.value() for s in self.link_weight_spins]
+        actuator_masses = [sel.value() for sel in self.actuator_selectors]
+        payload = float(self.payload_spin.value())
+        joint_labels = [blk.label for blk in self.blocks]
+
+        _torques, text = compute_torques_with_breakdown(
+            lengths_m=lengths_m,
+            link_masses=link_masses,
+            actuator_masses=actuator_masses,
+            payload_mass=payload,
+            joint_labels=joint_labels,
+        )
+        dlg = MathBreakdownDialog(
+            text, self, title="Live MTC Math Breakdown"
+        )
+        dlg.exec()
+
+
+# =========================================================================
 class ZoomableView(QGraphicsView):
     """Wheel-zoom anchored on the cursor, with full-viewport redraws."""
 
@@ -240,6 +446,21 @@ class VisualizerWindow(QMainWindow):
         self.scale_legend.show()
         self.shape_legend.show()
         self.links_legend.show()
+
+        # Live MTC dock panel — right-hand side, dockable / floatable.
+        self.mtc_panel = LiveMTCPanel(self.blocks, self.links, self)
+        scroll = QScrollArea()
+        scroll.setWidget(self.mtc_panel)
+        scroll.setWidgetResizable(True)
+        self.mtc_dock = QDockWidget("Live MTC Tracker", self)
+        self.mtc_dock.setWidget(scroll)
+        self.mtc_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.mtc_dock)
+
         self._refresh_status()
         self._position_overlays()
 
@@ -305,6 +526,8 @@ class VisualizerWindow(QMainWindow):
         if hasattr(self, "links_legend"):
             self.links_legend.update_links(self.links)
             self._position_overlays()
+        if hasattr(self, "mtc_panel"):
+            self.mtc_panel.refresh()
 
     # ---------------------------------------------------------------
     def _on_zoom(self, zoom: float):
