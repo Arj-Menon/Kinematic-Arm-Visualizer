@@ -3,6 +3,8 @@ Main application window: browse robotic arms from robotic_arms.xlsx and launch
 the Interactive Kinematic Sandbox for a selected row.
 """
 
+import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -16,10 +18,17 @@ from PyQt6.QtWidgets import (
 from pandas_model import PandasModel
 from visualizer_window import VisualizerWindow
 from add_arm_dialog import AddArmDialog
-from mtc_window import MTCWindow
+from updater import check_for_updates
 
 
-DEFAULT_XLSX = Path(__file__).parent / "robotic_arms.xlsx"
+def _app_dir() -> Path:
+    """Folder next to the .exe when frozen, else next to this source file."""
+    if getattr(sys, "frozen", False):
+        return Path(os.path.dirname(sys.executable))
+    return Path(os.path.dirname(os.path.abspath(__file__)))
+
+
+DEFAULT_XLSX = _app_dir() / "robotic_arms.xlsx"
 
 EXPECTED_COLUMNS = [
     "Company", "Model", "Kinematic Chain",
@@ -43,6 +52,14 @@ HEADER_RENAME_MAP = {
 }
 
 
+def _ensure_template(path: Path) -> None:
+    """Create a blank Excel with the canonical headers if `path` is missing."""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=EXPECTED_COLUMNS).to_excel(path, index=False)
+
+
 def _normalize_headers(df):
     """Rename legacy columns, drop exact duplicates, enforce canonical order."""
     df = df.rename(columns=HEADER_RENAME_MAP)
@@ -60,18 +77,19 @@ def _normalize_headers(df):
 class MainWindow(QMainWindow):
     """Top-level window with the arm catalogue table."""
 
-    def __init__(self):
+    def __init__(self, current_version: str = "v0.0.0"):
         super().__init__()
         self.setWindowTitle("Robotic Arm Manager")
         self.resize(1000, 600)
 
         self.df = pd.DataFrame(columns=EXPECTED_COLUMNS)
         self._visualizers = []  # keep references so windows aren't GC'd
-        self._mtc_windows = []
         self.current_xlsx = DEFAULT_XLSX
         self.model: PandasModel | None = None
+        self._current_version = current_version
 
         self._build_ui()
+        _ensure_template(DEFAULT_XLSX)
         self._load_excel(DEFAULT_XLSX)
 
     # ------------------------------------------------------------------
@@ -93,14 +111,12 @@ class MainWindow(QMainWindow):
         self.btn_reload = QPushButton("Reload Excel…")
         self.btn_add = QPushButton("Add New Arm…")
         self.btn_save = QPushButton("Save Changes")
-        self.btn_launch_mtc = QPushButton("Launch MTC")
         self.btn_launch = QPushButton("Launch Visualizer")
         self.btn_launch.setDefault(True)
         btn_row.addWidget(self.btn_reload)
         btn_row.addWidget(self.btn_add)
         btn_row.addWidget(self.btn_save)
         btn_row.addStretch(1)
-        btn_row.addWidget(self.btn_launch_mtc)
         btn_row.addWidget(self.btn_launch)
         layout.addLayout(btn_row)
 
@@ -116,11 +132,18 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(act_quit)
 
+        # Help menu
+        act_check = QAction("Check for &Updates…", self)
+        act_check.triggered.connect(
+            lambda: check_for_updates(self._current_version, parent=self)
+        )
+        help_menu = self.menuBar().addMenu("&Help")
+        help_menu.addAction(act_check)
+
         # Signals
         self.btn_reload.clicked.connect(lambda: self._load_excel(self.current_xlsx))
         self.btn_add.clicked.connect(self._add_arm)
         self.btn_save.clicked.connect(self._save_changes)
-        self.btn_launch_mtc.clicked.connect(self._launch_mtc)
         self.btn_launch.clicked.connect(self._launch_visualizer)
         self.table.doubleClicked.connect(lambda _ix: self._launch_visualizer())
 
@@ -175,28 +198,6 @@ class MainWindow(QMainWindow):
             self, "Saved",
             f"Saved {len(self.df)} rows to {self.current_xlsx.name}.",
         )
-
-    def _launch_mtc(self):
-        """Open the standalone Motor Torque Calculator, pre-filled if possible."""
-        row = self._selected_row()
-        chain = "Y-P-P-R-P-R"
-        length = 600.0
-        arm_label = ""
-        if row is not None:
-            c = str(row.get("Kinematic Chain", "") or "").strip()
-            if c:
-                chain = c
-            try:
-                ml = float(row.get("Max Length [mm]", 0) or 0)
-                if ml > 0:
-                    length = ml
-            except (TypeError, ValueError):
-                pass
-            arm_label = f"{row.get('Company', '')} {row.get('Model', '')}".strip()
-        dlg = MTCWindow(chain=chain, total_length_mm=length,
-                        arm_label=arm_label, parent=self)
-        dlg.show()
-        self._mtc_windows.append(dlg)
 
     def _add_arm(self):
         dlg = AddArmDialog(self)

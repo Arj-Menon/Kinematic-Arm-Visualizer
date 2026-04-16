@@ -22,13 +22,16 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QScrollArea, QHBoxLayout, QPushButton,
 )
 
-from graphics_items import JointBlock, LinkLine, GridScene
-from mtc_window import (
+from graphics_items import JointBlock, LinkLine, GridScene, EndEffectorItem
+from mtc_core import (
     compute_torques_full, compute_torques_with_breakdown,
     MathBreakdownDialog,
 )
 from actuator_selector import ActuatorSelector
 import actuators_db
+
+
+KIND_NAMES = {"Y": "Yaw", "P": "Pitch", "R": "Roll"}
 
 
 SCENE_W = 4000
@@ -82,7 +85,7 @@ class ScaleLegend(QFrame):
 
 # =========================================================================
 class LinksLegend(QLabel):
-    """Top-left overlay listing every link's live mm_length."""
+    """Top-left overlay: joint roster (live names + types) + link lengths."""
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -94,21 +97,50 @@ class LinksLegend(QLabel):
             "padding: 6px 10px; color: #212121;"
         )
         self.setFont(QFont("Consolas", 9))
+        self._blocks: list = []
+        self._links: list = []
         self.setText("")
 
+    def set_blocks(self, blocks):
+        self._blocks = list(blocks)
+        self._render()
+
     def update_links(self, links):
-        if not links:
-            self.setText("<b>Links</b><br/><i>(none)</i>")
+        self._links = list(links)
+        self._render()
+
+    def update_joints(self):
+        """Re-render after a joint label or kind change."""
+        self._render()
+
+    def _render(self):
+        if self._blocks:
+            joint_rows = "".join(
+                f"• {blk.label} "
+                f"<span style='color:#555'>"
+                f"({KIND_NAMES.get(blk.kind, blk.kind)})</span><br/>"
+                for blk in self._blocks
+            )
+            joints_section = (
+                f"<b>Joints</b><br/>{joint_rows}"
+            )
         else:
-            rows = "".join(
-                f"• L{i+1} = {lk.mm_length:.1f} mm<br/>"
-                for i, lk in enumerate(links)
+            joints_section = "<b>Joints</b><br/><i>(none)</i>"
+
+        if self._links:
+            link_rows = "".join(
+                f"• L{i + 1} = {lk.mm_length:.1f} mm<br/>"
+                for i, lk in enumerate(self._links)
             )
-            total = sum(lk.mm_length for lk in links)
-            self.setText(
+            total = sum(lk.mm_length for lk in self._links)
+            links_section = (
                 f"<b>Links</b> &nbsp; <span style='color:#555'>"
-                f"(Σ {total:.1f} mm)</span><br/>{rows}"
+                f"(Σ {total:.1f} mm)</span><br/>{link_rows}"
             )
+        else:
+            links_section = "<b>Links</b><br/><i>(none)</i>"
+
+        self.setText(joints_section + "<br/>" + links_section)
         self.adjustSize()
 
 
@@ -160,28 +192,33 @@ class ShapeLegend(QFrame):
 # =========================================================================
 class LiveMTCPanel(QWidget):
     """
-    Live Motor Torque tracker for the visualizer.
+    Live motor-torque tracker for the visualizer.
 
-    Inputs per joint/link row:
-      * Link Weight (QDoubleSpinBox).
-      * Actuator (QComboBox of presets + Custom… + "+" to save).
-    Plus a dedicated Payload (kg) row acting at the end-effector.
+    Per-joint physics (selected by joint type letter):
+      * Pitch (P)        -> tau = sum( m_i * g * r_i )
+      * Yaw / Roll (Y/R) -> tau = I * alpha,
+                            I = sum( m_i * (r_axial_i^2 + e_j^2) )
 
-    Math (horizontal arm, worst-case):
-      τ_j = Σ_{i≥j} m_link_i · g · (X_mid_i − X_j)
-          + Σ_{k>j} m_act_k  · g · (X_joint_k − X_j)
-          + m_payload · g · (X_end − X_j)
-
-    Refreshes reactively on: link resize (via on_length_changed →
-    _refresh_status), link weight change, actuator selection, and payload
-    change.
+    Inputs:
+      * Per link  : Length (mm, two-way bound to canvas) + Weight (kg).
+      * Per joint : Actuator preset, plus offset e (mm) — Y/R only.
+      * Tip       : End-Effector length (mm), End-Effector weight (kg),
+                    Payload weight (kg).
+      * Global    : Target angular acceleration alpha (rad/s^2).
     """
+
+    DEFAULT_ALPHA = 3.14  # rad/s^2
 
     def __init__(self, blocks: list, links: list, parent=None):
         super().__init__(parent)
         self.blocks = blocks
         self.links = links
         self._presets = actuators_db.load()
+        self._syncing_lengths = False  # canvas<->panel echo guard
+
+        # External hook: visualizer sets this to receive EE-length changes
+        # (so the canvas EE rectangle can be rescaled in real time).
+        self.on_ee_length_changed = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -191,15 +228,34 @@ class LiveMTCPanel(QWidget):
         root.addWidget(title)
 
         subtitle = QLabel(
-            "Worst-case static holding torque with the arm fully horizontal. "
-            "Accounts for link masses, outboard actuator masses, and an "
-            "end-effector payload."
+            "Per-component torque, arm horizontal. "
+            "<b>Pitch</b>: Σ m·g·r per downstream mass. "
+            "<b>Yaw / Roll</b>: I·α with I = Σ m·(r_axial² + e²)."
         )
         subtitle.setWordWrap(True)
+        subtitle.setTextFormat(Qt.TextFormat.RichText)
         subtitle.setStyleSheet("color: #555;")
         root.addWidget(subtitle)
 
-        # --- Links: length (read-only) + link-weight spin -----------------
+        # --- Global dynamics input --------------------------------------
+        glob_frame = QFrame(); glob_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        glob_layout = QHBoxLayout(glob_frame)
+        glob_layout.addWidget(QLabel("<b>Target Angular Accel α</b>:"))
+        self.alpha_spin = QDoubleSpinBox()
+        self.alpha_spin.setRange(0.0, 10000.0)
+        self.alpha_spin.setDecimals(4)
+        self.alpha_spin.setSingleStep(0.1)
+        self.alpha_spin.setSuffix(" rad/s²")
+        self.alpha_spin.setValue(self.DEFAULT_ALPHA)
+        self.alpha_spin.setToolTip(
+            "Used by Yaw / Roll joints only (τ = I · α). Pitch ignores α."
+        )
+        self.alpha_spin.valueChanged.connect(self.refresh)
+        glob_layout.addWidget(self.alpha_spin)
+        glob_layout.addStretch(1)
+        root.addWidget(glob_frame)
+
+        # --- Links: editable length spin + link-weight spin -------------
         link_frame = QFrame(); link_frame.setFrameShape(QFrame.Shape.StyledPanel)
         link_v = QVBoxLayout(link_frame)
         link_v.addWidget(QLabel("<b>Links</b>"))
@@ -209,15 +265,26 @@ class LiveMTCPanel(QWidget):
         link_grid.addWidget(QLabel("<b>Length</b>"), 0, 1)
         link_grid.addWidget(QLabel("<b>Link Weight</b>"), 0, 2)
 
-        self.length_labels: list[QLabel] = []
+        self.length_spins: list[QDoubleSpinBox] = []
         self.link_weight_spins: list[QDoubleSpinBox] = []
         for i, link in enumerate(links):
             link_grid.addWidget(QLabel(f"L{i + 1}"), i + 1, 0)
 
-            lbl = QLabel(f"{link.mm_length:.1f} mm")
-            lbl.setStyleSheet("font-family: Consolas, monospace;")
-            link_grid.addWidget(lbl, i + 1, 1)
-            self.length_labels.append(lbl)
+            ls = QDoubleSpinBox()
+            ls.setRange(0.1, 100000.0)
+            ls.setDecimals(2)
+            ls.setSingleStep(1.0)
+            ls.setSuffix(" mm")
+            ls.setValue(link.mm_length)
+            ls.setToolTip(
+                "Edit to scale the link on the canvas. The visual link "
+                "and downstream chain follow live."
+            )
+            ls.valueChanged.connect(
+                lambda val, idx=i: self._on_length_spin_changed(idx, val)
+            )
+            link_grid.addWidget(ls, i + 1, 1)
+            self.length_spins.append(ls)
 
             ws = QDoubleSpinBox()
             ws.setRange(0.0, 1000.0)
@@ -230,66 +297,126 @@ class LiveMTCPanel(QWidget):
         link_v.addLayout(link_grid)
         root.addWidget(link_frame)
 
-        # --- Actuators: one preset selector per joint --------------------
+        # --- Actuators (+ Y/R offset) -----------------------------------
         act_frame = QFrame(); act_frame.setFrameShape(QFrame.Shape.StyledPanel)
         act_v = QVBoxLayout(act_frame)
         act_v.addWidget(QLabel("<b>Actuators (per joint)</b>"))
 
-        act_grid = QGridLayout()
-        act_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
-        act_grid.addWidget(QLabel("<b>Actuator Preset</b>"), 0, 1)
+        self.act_grid = QGridLayout()
+        self.act_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
+        self.act_grid.addWidget(QLabel("<b>Actuator Preset</b>"), 0, 1)
+        self.act_grid.addWidget(QLabel("<b>Offset e (mm)</b>"), 0, 2)
 
         self.actuator_selectors: list[ActuatorSelector] = []
+        self.act_joint_labels: list[QLabel] = []
+        self.offset_spins: list[QDoubleSpinBox] = []
         for i, blk in enumerate(blocks):
-            act_grid.addWidget(QLabel(blk.label), i + 1, 0)
+            jl = QLabel(blk.label)
+            self.act_grid.addWidget(jl, i + 1, 0)
+            self.act_joint_labels.append(jl)
+
             sel = ActuatorSelector(self._presets, self)
             sel.sig_changed = self.refresh
-            act_grid.addWidget(sel, i + 1, 1)
+            self.act_grid.addWidget(sel, i + 1, 1)
             self.actuator_selectors.append(sel)
-        act_v.addLayout(act_grid)
+
+            os = QDoubleSpinBox()
+            os.setRange(0.0, 100000.0)
+            os.setDecimals(2)
+            os.setSingleStep(1.0)
+            os.setSuffix(" mm")
+            os.setValue(0.0)
+            os.setToolTip(
+                "Perpendicular axis offset for Yaw / Roll joints. "
+                "Adds e² to the squared-radius of every downstream mass "
+                "in this joint's I. Disabled for Pitch joints."
+            )
+            os.valueChanged.connect(self.refresh)
+            self.act_grid.addWidget(os, i + 1, 2)
+            self.offset_spins.append(os)
+            self._sync_offset_enabled(i)
+        act_v.addLayout(self.act_grid)
         root.addWidget(act_frame)
 
-        # --- Payload ----------------------------------------------------
-        pay_frame = QFrame(); pay_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        pay_layout = QHBoxLayout(pay_frame)
-        pay_layout.addWidget(QLabel("<b>Payload</b> (at end-effector):"))
+        # --- End-effector + payload --------------------------------------
+        tip_frame = QFrame(); tip_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        tip_v = QVBoxLayout(tip_frame)
+        tip_v.addWidget(QLabel("<b>End-Effector & Payload</b>"))
+
+        tip_grid = QGridLayout()
+        tip_grid.addWidget(QLabel("End-Effector Length:"), 0, 0)
+        self.ee_length_spin = QDoubleSpinBox()
+        self.ee_length_spin.setRange(0.0, 100000.0)
+        self.ee_length_spin.setDecimals(2)
+        self.ee_length_spin.setSingleStep(1.0)
+        self.ee_length_spin.setSuffix(" mm")
+        self.ee_length_spin.setValue(0.0)
+        self.ee_length_spin.setToolTip(
+            "Light-red rectangle drawn from the last joint outward. "
+            "EE COM = last_joint + length / 2; payload tip = last_joint "
+            "+ length."
+        )
+        self.ee_length_spin.valueChanged.connect(self._on_ee_length_changed)
+        tip_grid.addWidget(self.ee_length_spin, 0, 1)
+
+        tip_grid.addWidget(QLabel("End-Effector Weight:"), 1, 0)
+        self.ee_weight_spin = QDoubleSpinBox()
+        self.ee_weight_spin.setRange(0.0, 1000.0)
+        self.ee_weight_spin.setDecimals(3)
+        self.ee_weight_spin.setSuffix(" kg")
+        self.ee_weight_spin.setValue(0.0)
+        self.ee_weight_spin.valueChanged.connect(self.refresh)
+        tip_grid.addWidget(self.ee_weight_spin, 1, 1)
+
+        tip_grid.addWidget(QLabel("Payload Weight:"), 2, 0)
         self.payload_spin = QDoubleSpinBox()
         self.payload_spin.setRange(0.0, 1000.0)
         self.payload_spin.setDecimals(3)
         self.payload_spin.setSuffix(" kg")
         self.payload_spin.setValue(0.0)
         self.payload_spin.valueChanged.connect(self.refresh)
-        pay_layout.addWidget(self.payload_spin)
-        pay_layout.addStretch(1)
-        root.addWidget(pay_frame)
+        tip_grid.addWidget(self.payload_spin, 2, 1)
+        tip_v.addLayout(tip_grid)
+        root.addWidget(tip_frame)
 
-        # --- Outputs ----------------------------------------------------
+        # --- Outputs -----------------------------------------------------
         out_frame = QFrame(); out_frame.setFrameShape(QFrame.Shape.StyledPanel)
         out_v = QVBoxLayout(out_frame)
-        out_v.addWidget(QLabel("<b>Required Holding Torque</b>"))
+        out_v.addWidget(QLabel("<b>Required Torque</b>"))
 
-        out_grid = QGridLayout()
-        out_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
-        out_grid.addWidget(QLabel("<b>Torque (N·m)</b>"), 0, 1)
+        self.out_grid = QGridLayout()
+        self.out_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
+        self.out_grid.addWidget(QLabel("<b>Regime</b>"), 0, 1)
+        self.out_grid.addWidget(QLabel("<b>Torque (N·m)</b>"), 0, 2)
 
         self.torque_labels: list[QLabel] = []
+        self.out_joint_labels: list[QLabel] = []
+        self.out_regime_labels: list[QLabel] = []
         for i, blk in enumerate(blocks):
-            out_grid.addWidget(QLabel(blk.label), i + 1, 0)
+            jl = QLabel(blk.label)
+            self.out_grid.addWidget(jl, i + 1, 0)
+            self.out_joint_labels.append(jl)
+
+            rl = QLabel(self._regime_text(blk.kind))
+            rl.setStyleSheet("color: #555;")
+            self.out_grid.addWidget(rl, i + 1, 1)
+            self.out_regime_labels.append(rl)
+
             tl = QLabel("0.00")
             tl.setStyleSheet(
                 "font-family: Consolas, monospace; font-weight: bold;"
                 " padding: 2px 8px;"
             )
-            out_grid.addWidget(tl, i + 1, 1)
+            self.out_grid.addWidget(tl, i + 1, 2)
             self.torque_labels.append(tl)
-        out_v.addLayout(out_grid)
+        out_v.addLayout(self.out_grid)
         root.addWidget(out_frame)
 
         # --- Math verification ------------------------------------------
         self.btn_breakdown = QPushButton("Show Math Breakdown")
         self.btn_breakdown.setToolTip(
-            "Open an audit view listing every force × lever-arm term "
-            "contributing to each joint's torque."
+            "Per-joint audit listing m, r_axial, e, r and the resulting "
+            "moment / inertia for every downstream mass."
         )
         self.btn_breakdown.clicked.connect(self._show_breakdown)
         root.addWidget(self.btn_breakdown)
@@ -298,9 +425,34 @@ class LiveMTCPanel(QWidget):
         self.refresh()
 
     # ----------------------------------------------------------------
+    @staticmethod
+    def _regime_text(kind: str) -> str:
+        k = (kind or "").upper()[:1]
+        if k == "P":
+            return "Pitch — Σ m·g·r"
+        if k == "Y":
+            return "Yaw — I·α (uses e)"
+        if k == "R":
+            return "Roll — I·α (uses e)"
+        return "Unknown — I·α"
+
+    def _sync_offset_enabled(self, i: int):
+        """Pitch joints can't have an axis offset — grey it out + zero it."""
+        if not (0 <= i < len(self.offset_spins)):
+            return
+        kind = (self.blocks[i].kind or "").upper()[:1]
+        spin = self.offset_spins[i]
+        if kind == "P":
+            blocked = spin.blockSignals(True)
+            spin.setValue(0.0)
+            spin.setEnabled(False)
+            spin.blockSignals(blocked)
+        else:
+            spin.setEnabled(True)
+
+    # ----------------------------------------------------------------
     def on_preset_added(self, presets: dict[str, float],
                         select_name: str, origin: "ActuatorSelector"):
-        """A selector just saved a new preset -- rebroadcast to peers."""
         self._presets = presets
         for sel in self.actuator_selectors:
             if sel is origin:
@@ -312,21 +464,80 @@ class LiveMTCPanel(QWidget):
                 sel.refresh_presets(presets, keep_selection=True)
         self.refresh()
 
+    # ----------------------------------------------------------------
+    def relabel_joints(self):
+        """Re-render labels + regime tags after a canvas rename / retype."""
+        for i, blk in enumerate(self.blocks):
+            if i < len(self.act_joint_labels):
+                self.act_joint_labels[i].setText(blk.label)
+            if i < len(self.out_joint_labels):
+                self.out_joint_labels[i].setText(blk.label)
+            if i < len(self.out_regime_labels):
+                self.out_regime_labels[i].setText(self._regime_text(blk.kind))
+            self._sync_offset_enabled(i)
+        self.refresh()
+
+    # ----------------------------------------------------------------
+    def _on_length_spin_changed(self, idx: int, value_mm: float):
+        if self._syncing_lengths:
+            return
+        if not (0 <= idx < len(self.links)):
+            return
+        link = self.links[idx]
+        if abs(link.mm_length - value_mm) < 1e-6:
+            return
+        link.set_mm_length(value_mm)
+
+    def _on_ee_length_changed(self, value_mm: float):
+        """Forward EE length to the visualizer canvas, then recompute."""
+        if callable(self.on_ee_length_changed):
+            self.on_ee_length_changed(float(value_mm))
+        self.refresh()
+
+    # ----------------------------------------------------------------
+    def ee_length_mm(self) -> float:
+        return float(self.ee_length_spin.value())
+
+    def ee_mass_kg(self) -> float:
+        return float(self.ee_weight_spin.value())
+
+    # ----------------------------------------------------------------
     def refresh(self):
         """Recompute torques from live scene + all input widgets."""
+        # Sync canvas lengths -> spinboxes (no echo back to set_mm_length).
+        self._syncing_lengths = True
+        try:
+            for i, lk in enumerate(self.links):
+                if i >= len(self.length_spins):
+                    break
+                spin = self.length_spins[i]
+                if abs(spin.value() - lk.mm_length) > 1e-6:
+                    blocked = spin.blockSignals(True)
+                    spin.setValue(lk.mm_length)
+                    spin.blockSignals(blocked)
+        finally:
+            self._syncing_lengths = False
+
         lengths_m = [lk.mm_length / 1000.0 for lk in self.links]
         link_masses = [s.value() for s in self.link_weight_spins]
         actuator_masses = [sel.value() for sel in self.actuator_selectors]
+        joint_kinds = [blk.kind for blk in self.blocks]
+        joint_offsets_m = [s.value() / 1000.0 for s in self.offset_spins]
         payload = float(self.payload_spin.value())
-
-        for i, lk in enumerate(self.links):
-            self.length_labels[i].setText(f"{lk.mm_length:.1f} mm")
+        ee_length_m = float(self.ee_length_spin.value()) / 1000.0
+        ee_mass = float(self.ee_weight_spin.value())
+        alpha = float(self.alpha_spin.value())
 
         torques = compute_torques_full(
             lengths_m=lengths_m,
             link_masses=link_masses,
             actuator_masses=actuator_masses,
             payload_mass=payload,
+            joint_kinds=joint_kinds,
+            joint_offsets_m=joint_offsets_m,
+            target_alpha=alpha,
+            ee_length_m=ee_length_m,
+            ee_mass=ee_mass,
         )
         for i, tl in enumerate(self.torque_labels):
             if i < len(torques):
@@ -336,19 +547,28 @@ class LiveMTCPanel(QWidget):
 
     # ----------------------------------------------------------------
     def _show_breakdown(self):
-        """Pop up a read-only dialog with the full math breakdown."""
         lengths_m = [lk.mm_length / 1000.0 for lk in self.links]
         link_masses = [s.value() for s in self.link_weight_spins]
         actuator_masses = [sel.value() for sel in self.actuator_selectors]
-        payload = float(self.payload_spin.value())
+        joint_kinds = [blk.kind for blk in self.blocks]
+        joint_offsets_m = [s.value() / 1000.0 for s in self.offset_spins]
         joint_labels = [blk.label for blk in self.blocks]
+        payload = float(self.payload_spin.value())
+        ee_length_m = float(self.ee_length_spin.value()) / 1000.0
+        ee_mass = float(self.ee_weight_spin.value())
+        alpha = float(self.alpha_spin.value())
 
         _torques, text = compute_torques_with_breakdown(
             lengths_m=lengths_m,
             link_masses=link_masses,
             actuator_masses=actuator_masses,
             payload_mass=payload,
+            joint_kinds=joint_kinds,
+            joint_offsets_m=joint_offsets_m,
             joint_labels=joint_labels,
+            target_alpha=alpha,
+            ee_length_m=ee_length_m,
+            ee_mass=ee_mass,
         )
         dlg = MathBreakdownDialog(
             text, self, title="Live MTC Math Breakdown"
@@ -443,12 +663,28 @@ class VisualizerWindow(QMainWindow):
                                         mm=LEGEND_MM)
         self.shape_legend = ShapeLegend(vp)
         self.links_legend = LinksLegend(vp)
+        self.links_legend.set_blocks(self.blocks)
         self.scale_legend.show()
         self.shape_legend.show()
         self.links_legend.show()
 
+        # End-effector visual: rectangle anchored at last joint.
+        self.ee_item: EndEffectorItem | None = None
+        if self.blocks:
+            self.ee_item = EndEffectorItem(
+                self.blocks[-1], mm_length=0.0, px_per_mm=self.px_per_mm,
+            )
+            self.scene.addItem(self.ee_item)
+            self.ee_item.update_geometry()
+
         # Live MTC dock panel — right-hand side, dockable / floatable.
         self.mtc_panel = LiveMTCPanel(self.blocks, self.links, self)
+        self.mtc_panel.on_ee_length_changed = self._on_ee_length_changed
+
+        # Two-way binding: when a joint is renamed / retyped on the canvas,
+        # propagate to the panel rows + the joint legend.
+        for blk in self.blocks:
+            blk.on_changed = self._on_joint_changed
         scroll = QScrollArea()
         scroll.setWidget(self.mtc_panel)
         scroll.setWidgetResizable(True)
@@ -526,8 +762,25 @@ class VisualizerWindow(QMainWindow):
         if hasattr(self, "links_legend"):
             self.links_legend.update_links(self.links)
             self._position_overlays()
+        if getattr(self, "ee_item", None) is not None:
+            self.ee_item.update_geometry()
         if hasattr(self, "mtc_panel"):
             self.mtc_panel.refresh()
+
+    # ---------------------------------------------------------------
+    def _on_joint_changed(self, _block):
+        """Canvas just renamed / retyped a joint — re-sync legend + panel."""
+        if hasattr(self, "links_legend"):
+            self.links_legend.update_joints()
+            self._position_overlays()
+        if hasattr(self, "mtc_panel"):
+            self.mtc_panel.relabel_joints()
+
+    # ---------------------------------------------------------------
+    def _on_ee_length_changed(self, mm: float):
+        """Panel changed EE length — rescale the canvas rectangle."""
+        if self.ee_item is not None:
+            self.ee_item.set_mm_length(mm)
 
     # ---------------------------------------------------------------
     def _on_zoom(self, zoom: float):

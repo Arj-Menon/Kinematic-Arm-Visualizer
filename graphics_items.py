@@ -127,6 +127,10 @@ class JointBlock(QGraphicsRectItem):
         self._last_pos = QPointF(0.0, 0.0)
         self.is_base = False
 
+        # Optional callback fired after the joint's label or kind changes
+        # (so external panels / legends can re-sync names + types).
+        self.on_changed = None
+
         # Visuals
         self.setBrush(QBrush(self.COLORS.get(self.kind, QColor("#BDBDBD"))))
         self.setPen(QPen(Qt.GlobalColor.black, 2))
@@ -361,6 +365,8 @@ class JointBlock(QGraphicsRectItem):
         self.recompute_size()
         self._center_text()
         self.update()
+        if callable(self.on_changed):
+            self.on_changed(self)
 
     def on_text_changed(self, new_text: str):
         """Update label text and, if its leading letter changes, the shape."""
@@ -371,12 +377,15 @@ class JointBlock(QGraphicsRectItem):
         self.label = new_text
         self.text_item.setText(new_text)
         if leading in ("Y", "P", "R") and leading != self.kind:
+            # set_kind will fire on_changed once after applying both updates.
             self.set_kind(leading)
         else:
             # Still need to refit -- text width changed.
             self.recompute_size()
             self._center_text()
             self.update()
+            if callable(self.on_changed):
+                self.on_changed(self)
 
     # ----- context menu ---------------------------------------------------
     def _split_label(self) -> tuple[str, int]:
@@ -609,3 +618,75 @@ class LinkLine(QGraphicsLineItem):
             )
             if ok:
                 self.set_mm_length(val)
+
+
+# =========================================================================
+class EndEffectorItem(QGraphicsItem):
+    """Light-red rectangle anchored at the last joint, extending forward.
+
+    Length and width are scene-units (px). Length tracks `mm_length *
+    px_per_mm`; width is proportional to the last joint's block size.
+    Orientation is taken from the last link's direction (parent->last).
+    Origin sits exactly at the last joint's position; positive x extends
+    out along the arm. The payload tip is at (length, 0).
+    """
+
+    FILL = QColor("#FFCDD2")
+    EDGE = QColor("#C62828")
+
+    def __init__(self, last_block: "JointBlock",
+                 mm_length: float = 0.0, px_per_mm: float = 1.0):
+        super().__init__()
+        self.last_block = last_block
+        self.mm_length = max(0.0, float(mm_length))
+        self.px_per_mm = px_per_mm
+        self.setZValue(1)  # above grid + links, below joint blocks
+
+    # ------- geometry --------------------------------------------------
+    def _length_px(self) -> float:
+        return max(0.0, self.mm_length) * self.px_per_mm
+
+    def _width_px(self) -> float:
+        return max(self.last_block.size * 0.7, 8.0)
+
+    def boundingRect(self) -> QRectF:
+        L = self._length_px()
+        w = self._width_px()
+        # Add small margin so the edge stroke isn't clipped.
+        return QRectF(-2.0, -w / 2 - 2.0, L + 4.0, w + 4.0)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        L = self._length_px()
+        if L <= 0.0:
+            return
+        w = self._width_px()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QBrush(self.FILL))
+        painter.setPen(QPen(self.EDGE, 1.5))
+        painter.drawRect(QRectF(0.0, -w / 2.0, L, w))
+        # Mark the payload tip with a small notch so it's obvious where
+        # the payload force is applied.
+        painter.setPen(QPen(self.EDGE, 1.5))
+        painter.drawLine(QPointF(L, -w / 2.0 - 3.0),
+                         QPointF(L, w / 2.0 + 3.0))
+
+    # ------- updates ---------------------------------------------------
+    def set_mm_length(self, mm: float):
+        self.prepareGeometryChange()
+        self.mm_length = max(0.0, float(mm))
+        self.update_geometry()
+
+    def update_geometry(self):
+        """Re-anchor + re-orient using the last link's direction."""
+        prev = self.last_block.parent_block
+        if prev is not None:
+            d = self.last_block.pos() - prev.pos()
+            dx, dy = d.x(), d.y()
+        else:
+            dx, dy = 1.0, 0.0
+        ang_deg = (math.degrees(math.atan2(dy, dx))
+                   if (dx or dy) else 0.0)
+        self.prepareGeometryChange()
+        self.setPos(self.last_block.pos())
+        self.setRotation(ang_deg)
+        self.update()
