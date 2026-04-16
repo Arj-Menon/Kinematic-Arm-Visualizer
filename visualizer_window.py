@@ -18,10 +18,12 @@ from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QBrush, QColor, QPen, QFont, QPolygonF
 from PyQt6.QtWidgets import (
     QMainWindow, QGraphicsView, QInputDialog, QMessageBox, QToolBar,
-    QLabel, QWidget, QVBoxLayout, QFrame,
+    QLabel, QWidget, QVBoxLayout, QFrame, QDockWidget, QGridLayout,
+    QDoubleSpinBox, QScrollArea,
 )
 
 from graphics_items import JointBlock, LinkLine, GridScene
+from mtc_window import compute_torques
 
 
 SCENE_W = 4000
@@ -151,6 +153,109 @@ class ShapeLegend(QFrame):
 
 
 # =========================================================================
+class LiveMTCPanel(QWidget):
+    """
+    Live Motor Torque tracker for the visualizer.
+
+    Pulls each link's current `mm_length` from the scene and lets the user
+    assign a weight per link. Every time a length (right-click resize) or
+    a weight changes, the worst-case holding torque at every joint is
+    recomputed and displayed.
+    """
+
+    def __init__(self, blocks: list, links: list, parent=None):
+        super().__init__(parent)
+        self.blocks = blocks
+        self.links = links
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        title = QLabel("<h3>Live MTC Tracker</h3>")
+        title.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(title)
+
+        subtitle = QLabel(
+            "Worst-case static holding torque (arm fully horizontal, "
+            "COM at link midpoint)."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #555;")
+        root.addWidget(subtitle)
+
+        # --- Inputs: per-link length (read-only) + weight spin box ---
+        in_frame = QFrame(); in_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        in_v = QVBoxLayout(in_frame)
+        in_v.addWidget(QLabel("<b>Links</b>"))
+        in_grid = QGridLayout()
+        in_grid.addWidget(QLabel("<b>#</b>"), 0, 0)
+        in_grid.addWidget(QLabel("<b>Length</b>"), 0, 1)
+        in_grid.addWidget(QLabel("<b>Weight</b>"), 0, 2)
+
+        self.length_labels: list[QLabel] = []
+        self.weight_spins: list[QDoubleSpinBox] = []
+        for i, link in enumerate(links):
+            in_grid.addWidget(QLabel(f"L{i + 1}"), i + 1, 0)
+
+            lbl = QLabel(f"{link.mm_length:.1f} mm")
+            lbl.setStyleSheet("font-family: Consolas, monospace;")
+            in_grid.addWidget(lbl, i + 1, 1)
+            self.length_labels.append(lbl)
+
+            ws = QDoubleSpinBox()
+            ws.setRange(0.0, 1000.0)
+            ws.setDecimals(3)
+            ws.setSuffix(" kg")
+            ws.setValue(1.0)
+            ws.valueChanged.connect(self.refresh)
+            in_grid.addWidget(ws, i + 1, 2)
+            self.weight_spins.append(ws)
+        in_v.addLayout(in_grid)
+        root.addWidget(in_frame)
+
+        # --- Outputs: torque per joint ---
+        out_frame = QFrame(); out_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        out_v = QVBoxLayout(out_frame)
+        out_v.addWidget(QLabel("<b>Joint Torques</b>"))
+        out_grid = QGridLayout()
+        out_grid.addWidget(QLabel("<b>Joint</b>"), 0, 0)
+        out_grid.addWidget(QLabel("<b>Torque (N·m)</b>"), 0, 1)
+
+        self.torque_labels: list[QLabel] = []
+        for i, blk in enumerate(blocks):
+            out_grid.addWidget(QLabel(blk.label), i + 1, 0)
+            tl = QLabel("0.00")
+            tl.setStyleSheet(
+                "font-family: Consolas, monospace; font-weight: bold;"
+                " padding: 2px 8px;"
+            )
+            out_grid.addWidget(tl, i + 1, 1)
+            self.torque_labels.append(tl)
+        out_v.addLayout(out_grid)
+        root.addWidget(out_frame)
+        root.addStretch(1)
+
+        self.refresh()
+
+    # ----------------------------------------------------------------
+    def refresh(self):
+        """Recompute torques from current link mm_lengths + spin weights."""
+        lengths_m = [lk.mm_length / 1000.0 for lk in self.links]
+        weights = [s.value() for s in self.weight_spins]
+
+        # Keep the length labels in sync with the live scene.
+        for i, lk in enumerate(self.links):
+            self.length_labels[i].setText(f"{lk.mm_length:.1f} mm")
+
+        torques = compute_torques(lengths_m, weights)
+        for i, tl in enumerate(self.torque_labels):
+            if i < len(torques):
+                tl.setText(f"{torques[i]:.2f}")
+            else:
+                tl.setText("—")
+
+
+# =========================================================================
 class ZoomableView(QGraphicsView):
     """Wheel-zoom anchored on the cursor, with full-viewport redraws."""
 
@@ -240,6 +345,21 @@ class VisualizerWindow(QMainWindow):
         self.scale_legend.show()
         self.shape_legend.show()
         self.links_legend.show()
+
+        # Live MTC dock panel — right-hand side, dockable / floatable.
+        self.mtc_panel = LiveMTCPanel(self.blocks, self.links, self)
+        scroll = QScrollArea()
+        scroll.setWidget(self.mtc_panel)
+        scroll.setWidgetResizable(True)
+        self.mtc_dock = QDockWidget("Live MTC Tracker", self)
+        self.mtc_dock.setWidget(scroll)
+        self.mtc_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.mtc_dock)
+
         self._refresh_status()
         self._position_overlays()
 
@@ -305,6 +425,8 @@ class VisualizerWindow(QMainWindow):
         if hasattr(self, "links_legend"):
             self.links_legend.update_links(self.links)
             self._position_overlays()
+        if hasattr(self, "mtc_panel"):
+            self.mtc_panel.refresh()
 
     # ---------------------------------------------------------------
     def _on_zoom(self, zoom: float):
